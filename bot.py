@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-IRC bot for the DI31001 socket-programming coursework (client / "bot" part).
+原文功能要求：
+Connecting to a server，
+Maintaining the connection to the server，
+Joining a channel
+Responding to channel messages starting with a '!' character and more specifically:
+"!hello" greeting the user sending it
+"!slap" slapping a random user in the channel with a trout excluding the bot and the user sending it. The command should also support an optional parameter to slap a specific user and slapping the user sending it if that user is not in the channel.
+Responding to each private message by a random sentence (nonsense or fun-fact)
+Provide one extra feature of your choice using any IRC command not used previously。对于最后一个要求，我们采用WHO（bot 全程没用过）+ CTCP ACTION（PRIVMSG 里套的特殊子协议，基本功能也没用过）。指令是
 
-What it does (see Project Brief, Section A.2):
-  * Connects to the group's IRC server over IPv6 and keeps the connection alive.
-  * Joins a channel and tracks the member list (via 353 / JOIN / PART / NICK / QUIT).
-  * Responds to channel commands that start with '!':
-        !hello            -> greets the sender
-        !slap [target]    -> slaps a random member (or a named one, or the
-                             sender if the named target is not in the channel)
-        !me <text>        -> sends a CTCP ACTION (an "emote")     [extra, Item I]
-        !who              -> issues the WHO command and reports the count [extra, Item I]
-  * Replies to every private message with a random fun-fact / nonsense line
-    loaded from facts.txt.
+To make it easier to be used and tested, your submitted program must be able to take the following optional command line parameters:
 
+"--host 2001:db8::1337" indicating the server the bot should connect to
+"--port 6666" indicating the port the bot should connect to
+"--name SuperBot" indicating the nickname the bot should use
+"--channel #hello" indicating the channel the bot should join and monitor for commands
 Design notes:
   * Pure Python standard library only (socket, argparse, random, re, time).
     Dependency-free so it runs as-is on the Windows VM.
@@ -21,7 +23,7 @@ Design notes:
 
 Usage (defaults already match the lab sheet, so 'python bot.py' just works):
     python bot.py
-    python bot.py --host fc00:b33f::17 --port 6667 --name SuperBot --channel #test
+    python bot.py --host fc00:1337::17 --port 6667 --name SuperBot --channel #test
 """
 
 from __future__ import annotations
@@ -40,9 +42,16 @@ CTCP = "\x01"  # CTCP framing character
 # Defaults that match the lab sheet / brief examples, so the bot "just works"
 # on the provided VMs. All four can be overridden on the CLI, which the brief
 # requires (omitting them costs up to 5 marks).
-DEFAULT_HOST = "fc00:b33f::17"   # Ubuntu VM IPv6 (lab sheet B.3). Note: the brief
-                                 # mistakenly writes fc00:1337::17 for Ubuntu; the
-                                 # lab sheet's fc00:b33f::17 is the correct address.
+#
+# 地址依据（配置 VM 的权威文档 Lab Sheet 2 + correctAddress 更正文档）：
+#   Windows VM IPv6 = fc00:1337::19/96   (Lab Sheet 2 B.2)  <- bot 跑在这台（客户端）
+#   Ubuntu  VM IPv6 = fc00:1337::17/96   (correctAddress 文档)  <- server 跑在这台，bot 连它
+# ⚠️ Lab Sheet 2 B.3 原文把 Ubuntu 写成 fc00:b33f::17，但那是错的前缀：
+#   它和 Windows 的 1337 前缀不同 → 两 VM 不在同一子网 → IPv6 互 ping 不通
+#   （这正是 Lab Sheet 2 B.4 让你"改 Ubuntu 配置"的原因）。
+#   correctAddress 文档已更正：Ubuntu 也用 1337 前缀，两 VM 同子网可直接通信。
+#   所以 bot 连接目标 = Ubuntu = fc00:1337::17。若你手抖把 Ubuntu 配回了 b33f，启动加 --host fc00:b33f::17。
+DEFAULT_HOST = "fc00:1337::17"   # Ubuntu VM IPv6 (correctAddress 更正; Lab Sheet 2 B.3 原 b33f 为错)
 DEFAULT_PORT = 6667              # server listens on the usual IRC port 6667
 DEFAULT_NAME = "SuperBot"        # brief's example nickname
 DEFAULT_CHANNEL = "#test"        # lab sheet / slides test channel
@@ -263,6 +272,7 @@ class IRCBot:
     def _reply_private(self, sender: str) -> None:
         fact = random.choice(self.facts)
         self._send(f"PRIVMSG {sender} :{fact}")
+# 对于!hello，我们采用PRIVMSG。
 
     def _handle_command(self, sender: str, text: str) -> None:
         parts = text.split(None, 1)
