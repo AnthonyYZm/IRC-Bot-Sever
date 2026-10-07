@@ -106,6 +106,7 @@ class IRCBot:
         self.sock: socket.socket | None = None
         self._recv_buf = b""
         self.users: set[str] = set()   # channel members, excluding self
+        self._names_pending = False    # True while a 353/366 name batch is open
         self._who_replies: list[list[str]] = []  # accumulated WHO 352 records
         self.connected = False
         self.running = True
@@ -199,10 +200,21 @@ class IRCBot:
             self._send(f"NICK {self.nick}")
             return
 
-        if cmd == "353":  # RPL_NAMREPLY -> populate/refresh member list.
+        if cmd == "353":  # RPL_NAMREPLY -> accumulate names (may span lines).
             # params: [target, '=', channel, "nick1 nick2 ..."]
+            # A full name list can arrive as several 353 lines followed by a
+            # single 366 (RPL_ENDOFNAMES). We reset the set on the first 353 of
+            # a batch and accumulate; 366 marks the list complete.
             if len(params) >= 4 and params[1] == "=":
+                if not self._names_pending:
+                    self.users.clear()          # start a fresh member list
+                    self._names_pending = True
                 self._update_users_from_names(params[3])
+            return
+
+        if cmd == "366":  # RPL_ENDOFNAMES -> name list complete.
+            self._names_pending = False
+            print(f"[names] member list complete ({len(self.users)} users)")
             return
 
         if cmd == "JOIN":
