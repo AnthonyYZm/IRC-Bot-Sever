@@ -1,0 +1,693 @@
+\documentclass[a4paper,12pt]{article}
+
+% Compile with XeLaTeX or LuaLaTeX
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{float}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    pdftitle={IRC Bot and Server: Code Functionality and Team Responsibilities}
+}
+
+\definecolor{codegray}{RGB}{245,245,245}
+
+\lstset{
+    backgroundcolor=\color{codegray},
+    basicstyle=\ttfamily\small,
+    columns=fullflexible,
+    frame=single,
+    rulecolor=\color{gray!40},
+    breaklines=true,
+    showstringspaces=false
+}
+
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2.2em}
+
+\title{
+    DI31001 Group Project\\
+    IRC Bot and IRC Server\\
+    Code Functionality and Team Responsibilities
+}
+
+\author{Group 2}
+\date{October, 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\newpage
+
+\section{Project Overview}
+
+This project implements a simplified IRC (Internet Relay Chat) system using IPv6 TCP. It contains two main programs:
+
+\begin{itemize}
+    \item \texttt{server.py}: accepts multiple client connections, handles registration, manages channels, and routes channel and private messages.
+    \item \texttt{bot.py}: connects to the server, joins a channel automatically, responds to commands, and replies to private messages.
+\end{itemize}
+
+Both programs use only the Python standard library. IRC messages are text-based and terminated by CRLF (\texttt{\textbackslash r\textbackslash n}).
+
+\section{System Architecture}
+
+The Ubuntu virtual machine runs the server and the Windows virtual machine runs the bot. HexChat can be used as a human IRC client. The programs communicate through IPv6 TCP.
+
+\begin{verbatim}
+HexChat client  -------- IPv6 TCP -------->  server.py
+bot.py         -------- IPv6 TCP -------->  server.py
+\end{verbatim}
+
+The default configuration is shown below.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{>{\raggedright\arraybackslash}p{5cm}p{7cm}}
+\toprule
+Item & Default value \\
+\midrule
+Server bind address & \texttt{::} \\
+Server port & \texttt{6667} \\
+Bot server address & \texttt{fc00:1337::17} \\
+Bot nickname & \texttt{SuperBot} \\
+Bot channel & \texttt{\#test} \\
+\bottomrule
+\end{tabular}
+\caption{Default network configuration}
+\end{table}
+
+The communication sequence is:
+
+\begin{enumerate}
+    \item The server opens an IPv6 TCP listening socket.
+    \item A client sends \texttt{NICK} and \texttt{USER} to register.
+    \item The server returns welcome messages, including numeric reply \texttt{001}.
+    \item The bot sends \texttt{JOIN} after receiving \texttt{001}.
+    \item Clients use \texttt{PRIVMSG} for channel and private messages.
+    \item \texttt{PING}/\texttt{PONG} messages maintain the connection.
+\end{enumerate}
+
+\section{Server Functionality (\texttt{server.py})}
+
+\subsection{Networking and Multiple Clients}
+
+The server uses an IPv6 TCP socket and Python's \texttt{selectors} event loop. Each connection is represented by a \texttt{ClientSession}. The server stores each client's nickname, username, real name, joined channels, and send/receive buffers. Non-blocking sockets allow multiple clients to be handled in one process.
+
+The server also buffers incomplete IRC lines and limits line, receive-buffer, and send-buffer sizes to handle abnormal input safely.
+
+\subsection{Registration and Nickname Management}
+
+The server processes \texttt{NICK} and \texttt{USER}. After both are received, it marks the client as registered and sends the welcome and MOTD messages. It validates nicknames and prevents duplicate names:
+
+\begin{itemize}
+    \item \texttt{431}: no nickname was supplied;
+    \item \texttt{432}: the nickname is invalid;
+    \item \texttt{433}: the nickname is already in use;
+    \item \texttt{462}: a registered client attempted to register again.
+\end{itemize}
+
+\subsection{Channel Management}
+
+\texttt{JOIN} creates a channel if needed, adds the member, and broadcasts the join event. \texttt{PART} removes the member and broadcasts the part event. \texttt{NAMES} returns the channel member list. Empty channels are removed.
+
+Channel names must begin with \texttt{\#} and cannot contain spaces, commas, or newline characters.
+
+\subsection{Message Routing}
+
+For \texttt{PRIVMSG}, a target beginning with \texttt{\#} is treated as a channel and the message is sent to the other members. A nickname target is treated as a private message and is sent to the matching client. Unknown targets produce numeric error replies.
+
+The sender does not receive a server echo for a channel message because IRC clients normally display their own messages locally.
+
+The server also supports \texttt{NOTICE}, \texttt{WHO}, \texttt{MODE}, and basic \texttt{CAP} negotiation used by HexChat.
+
+\subsection{Errors and Keep-Alive}
+
+Unknown commands produce numeric reply \texttt{421}. Malformed input is isolated to the affected client. The server periodically checks activity, sends \texttt{PING} to idle clients, and disconnects clients that do not return \texttt{PONG}. Nickname and channel state are cleaned up on disconnection.
+
+\section{Bot Functionality (\texttt{bot.py})}
+
+\subsection{Connection and Registration}
+
+The bot creates an IPv6 TCP socket using \texttt{AF\_INET6} and \texttt{SOCK\_STREAM}. It sends:
+
+\begin{verbatim}
+NICK SuperBot
+USER SuperBot 0 * :SuperBot coursework bot
+\end{verbatim}
+
+After receiving \texttt{001}, it joins its configured channel. It automatically reconnects after a connection failure. If the nickname is taken, it appends an underscore and retries.
+
+\subsection{Member List}
+
+The bot maintains a set of channel members by processing \texttt{353}, \texttt{JOIN}, \texttt{PART}, \texttt{NICK}, and \texttt{QUIT}. This set is used by the random \texttt{!slap} command.
+
+\subsection{Channel Commands}
+
+\begin{longtable}{p{4cm}p{9cm}}
+\caption{Bot channel commands}
+\label{tab:botcommands}\\
+\toprule
+Command & Function \\
+\midrule
+\endfirsthead
+
+\toprule
+Command & Function \\
+\midrule
+\endhead
+
+\texttt{!hello} & Greets the sender. \\
+
+\texttt{!slap} & Selects a random member, excluding the bot and sender. If no other member exists, the sender is selected. \\
+
+\texttt{!slap <nickname>} & Slaps the named user if present; otherwise slaps the sender. \\
+
+\texttt{!me <text>} & Sends a CTCP ACTION message. \\
+
+\texttt{!who} & Uses \texttt{WHO} and reports the number of returned member records. \\
+
+\bottomrule
+\end{longtable}
+
+\subsection{Private Messages}
+
+When the target matches the bot's nickname, the bot selects a random non-empty line from \texttt{facts.txt} and replies with \texttt{PRIVMSG}. If the file is missing or empty, a built-in fallback reply is used.
+
+\subsection{Command-Line Options}
+
+\begin{verbatim}
+python bot.py --host <IPv6 address> --port <port> \
+    --name <nickname> --channel <channel>
+\end{verbatim}
+
+These options allow the same program to run on the virtual machines or a local loopback address.
+
+\section{Mapping to the Marking Criteria}
+
+This section explains how the implemented bot functionality satisfies the marking criteria.
+
+\subsection{Item E: Connecting, Handling Errors, and Staying Connected}
+
+The bot must connect to the IRC server, maintain the connection, and handle common connection errors.
+
+The implementation satisfies this requirement in the following ways:
+
+\begin{itemize}
+    \item The bot creates an IPv6 TCP socket using \texttt{AF\_INET6} and \texttt{SOCK\_STREAM}.
+    \item The bot connects to the configured server address and port.
+    \item It sends \texttt{NICK} and \texttt{USER} to complete registration.
+    \item It responds to server \texttt{PING} messages with \texttt{PONG}.
+    \item If the connection is lost, the bot closes the old socket and attempts to reconnect automatically.
+    \item If the nickname is already in use, the bot appends an underscore and tries again.
+    \item Connection failures are caught and handled without terminating the whole program.
+\end{itemize}
+
+The main implementation is provided by the following methods:
+
+\begin{lstlisting}[language=Python]
+connect()
+run()
+_handle()
+\end{lstlisting}
+
+A simple test is to stop the server after the bot has connected and then restart it. The bot should enter its reconnection loop and connect again when the server becomes available.
+
+\subsection{Item F: Joining a Channel and Maintaining the User List}
+
+The bot must join a channel and keep track of the users currently in that channel.
+
+After receiving the registration welcome message \texttt{001}, the bot automatically sends a \texttt{JOIN} command for the configured channel.
+
+The bot updates its member list when it receives the following IRC messages:
+
+\begin{itemize}
+    \item \texttt{353}: initial channel names list;
+    \item \texttt{JOIN}: a user joins the channel;
+    \item \texttt{PART}: a user leaves the channel;
+    \item \texttt{NICK}: a user changes nickname;
+    \item \texttt{QUIT}: a user disconnects from the server.
+\end{itemize}
+
+The member list is stored in the bot's \texttt{users} set. It is mainly used by the \texttt{!slap} command to select a valid target.
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+_update_users_from_names()
+_handle()
+\end{lstlisting}
+
+\subsection{Item G: Replying to Private Messages}
+
+The bot must reply to every private message with a random sentence, fact, or nonsense message.
+
+When the target of a \texttt{PRIVMSG} matches the bot's nickname, the bot treats the message as a private message. It selects one non-empty line from \texttt{facts.txt} and sends it back to the sender.
+
+For example:
+
+\begin{verbatim}
+Alice -> TestBot: Hello
+TestBot -> Alice: Honey never spoils.
+\end{verbatim}
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+_reply_private()
+load_facts()
+\end{lstlisting}
+
+If \texttt{facts.txt} is missing or empty, the bot uses a built-in fallback response instead of crashing.
+
+This feature can be tested in HexChat by opening a private chat with the bot and sending any message.
+
+\subsection{Item H: Channel Commands}
+
+The bot must respond to channel messages beginning with an exclamation mark. The required commands are \texttt{!hello} and \texttt{!slap}.
+
+\subsubsection{\texttt{!hello}}
+
+The command:
+
+\begin{verbatim}
+!hello
+\end{verbatim}
+
+causes the bot to send a greeting to the user who issued the command. For example:
+
+\begin{verbatim}
+Hello Alice! Nice to meet you.
+\end{verbatim}
+
+\subsubsection{\texttt{!slap}}
+
+The command:
+
+\begin{verbatim}
+!slap
+\end{verbatim}
+
+selects a random channel member. The bot excludes itself and the user who issued the command whenever other candidates are available.
+
+The command also accepts an optional nickname:
+
+\begin{verbatim}
+!slap Alice
+\end{verbatim}
+
+If Alice is present in the channel, Alice is selected. If Alice is not present, the sender of the command is selected instead.
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+_handle_command()
+_do_slap()
+\end{lstlisting}
+
+The bot sends the result as a CTCP ACTION message, which is displayed by IRC clients as an action or emote.
+
+\subsection{Item I: Additional IRC Features}
+
+The project implements two additional features beyond the required commands.
+
+\subsubsection{\texttt{!me}: CTCP ACTION}
+
+The command:
+
+\begin{verbatim}
+!me waves
+\end{verbatim}
+
+is converted into a CTCP ACTION message. An IRC client may display the result as:
+
+\begin{verbatim}
+* TestBot waves
+\end{verbatim}
+
+This feature uses the CTCP ACTION format inside a \texttt{PRIVMSG} message.
+
+\subsubsection{\texttt{!who}: WHO Command}
+
+The command:
+
+\begin{verbatim}
+!who
+\end{verbatim}
+
+causes the bot to send the IRC \texttt{WHO} command for the current channel.
+
+The server returns one or more \texttt{352} WHO reply records followed by a \texttt{315} end-of-list message. The bot counts the returned records and reports the result in the channel.
+
+For example:
+
+\begin{verbatim}
+WHO returned 2 member record(s) for #test.
+\end{verbatim}
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+_report_who()
+\end{lstlisting}
+
+These features demonstrate the use of IRC functionality beyond basic channel messages and private messages.
+
+\subsection{Summary of Items E--I}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{2cm}p{4cm}p{6cm}}
+\toprule
+Item & Requirement & Implementation \\
+\midrule
+E & Connection and keep-alive & IPv6 connection, registration, PING/PONG, error handling, and automatic reconnection. \\
+F & Channel membership & Automatic channel joining and member-list maintenance. \\
+G & Private messages & Random replies using \texttt{facts.txt}. \\
+H & Required commands & \texttt{!hello} and \texttt{!slap}. \\
+I & Additional feature & CTCP ACTION through \texttt{!me} and the IRC \texttt{WHO} command through \texttt{!who}. \\
+\bottomrule
+\end{tabular}
+\caption{Mapping between marking criteria and bot implementation}
+\end{table}
+
+\subsection{Item J: Supporting Multiple Clients}
+
+The server must allow multiple IRC clients to connect at the same time and manage them correctly.
+
+The server creates one \texttt{ClientSession} object for each connected client. It stores each session in an internal session table and uses the \texttt{selectors} event loop to monitor all sockets.
+
+The implementation supports:
+
+\begin{itemize}
+    \item multiple simultaneous TCP connections;
+    \item independent registration for each client;
+    \item separate nicknames, usernames, buffers, and channel memberships;
+    \item communication between multiple HexChat clients and the bot;
+    \item correct removal of a client after disconnection.
+\end{itemize}
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+IRCServer.start()
+_accept_client()
+ClientSession
+\end{lstlisting}
+
+This feature can be tested by connecting two or more HexChat clients to the same server using different nicknames.
+
+\subsection{Item K: Error Handling}
+
+The server must handle unknown commands, invalid nicknames, malformed messages, and disconnected clients without crashing.
+
+The server provides the following error handling:
+
+\begin{itemize}
+    \item unknown commands return numeric reply \texttt{421};
+    \item invalid nicknames return \texttt{432};
+    \item duplicate nicknames return \texttt{433};
+    \item missing command parameters return the appropriate numeric error;
+    \item messages sent to nonexistent users or channels return an error;
+    \item malformed input is isolated to the affected client;
+    \item clients that stop responding are detected and disconnected;
+    \item disconnected clients are removed from all channels and internal tables.
+\end{itemize}
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+parse_irc_line()
+_dispatch()
+_disconnect()
+_check_liveness()
+\end{lstlisting}
+
+This ensures that an invalid request from one client does not terminate the whole server.
+
+\subsection{Item L: Private Messaging}
+
+The server must support private messages between individual clients.
+
+When a client sends a \texttt{PRIVMSG} with a nickname as the target, the server searches its nickname index and forwards the message only to that client.
+
+For example:
+
+\begin{verbatim}
+Alice -> Bob: Hello Bob
+\end{verbatim}
+
+Only Bob receives the message. Other clients and channels do not receive it.
+
+If the target nickname does not exist, the server returns numeric reply \texttt{401}.
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+_cmd_privmsg()
+_route_message()
+\end{lstlisting}
+
+This feature can be tested by connecting two HexChat clients and sending a private message from one client to the other.
+
+\subsection{Item M: Joining and Leaving Channels}
+
+The server must support clients joining and leaving channels and must notify other channel members.
+
+The \texttt{JOIN} command performs the following operations:
+
+\begin{itemize}
+    \item validates the channel name;
+    \item creates the channel if it does not already exist;
+    \item adds the client to the channel;
+    \item broadcasts a \texttt{JOIN} message to the channel;
+    \item sends the topic and member list replies.
+\end{itemize}
+
+The \texttt{PART} command:
+
+\begin{itemize}
+    \item removes the client from the channel;
+    \item broadcasts a \texttt{PART} message;
+    \item returns an error if the client is not in the channel;
+    \item removes the channel when it has no remaining members.
+\end{itemize}
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+_cmd_join()
+_cmd_part()
+_send_names()
+\end{lstlisting}
+
+This feature can be tested in HexChat with:
+
+\begin{lstlisting}
+/join #test
+/part #test
+\end{lstlisting}
+
+Other users in the channel should see the join and part events.
+
+\subsection{Item N: Channel Messaging}
+
+The server must support messages sent to all members of a channel.
+
+When a client sends a \texttt{PRIVMSG} whose target begins with \texttt{\#}, the server checks whether the client is a member of that channel. If the client is a member, the message is broadcast to the other members of the channel.
+
+For example:
+
+\begin{verbatim}
+Alice -> #test: Hello everyone
+\end{verbatim}
+
+All other members of \texttt{\#test} receive the message. Alice does not receive a duplicate server echo because her IRC client already displays her own message locally.
+
+If the channel does not exist, the server returns \texttt{403}. If the sender is not a member of the channel, the server returns \texttt{404}.
+
+The main implementation is provided by:
+
+\begin{lstlisting}[language=Python]
+_cmd_privmsg()
+_route_message()
+_broadcast_channel()
+\end{lstlisting}
+
+This feature can be tested by connecting at least two clients, joining the same channel, and sending a normal message.
+
+
+\clearpage
+
+\subsection{Summary of Items E--I}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{2cm}p{4cm}p{6cm}}
+\toprule
+Item & Requirement & Implementation \\
+\midrule
+E & Connection and keep-alive
+& IPv6 connection, registration, PING/PONG, error handling, and automatic reconnection. \\
+
+F & Channel membership
+& Automatic channel joining and member-list maintenance. \\
+
+G & Private messages
+& Random replies using \texttt{facts.txt}. \\
+
+H & Required commands
+& \texttt{!hello} and \texttt{!slap}. \\
+
+I & Additional feature
+& CTCP ACTION through \texttt{!me} and the IRC \texttt{WHO} command through \texttt{!who}. \\
+
+\bottomrule
+\end{tabular}
+\caption{Mapping between marking criteria and bot implementation}
+\end{table}
+
+\clearpage
+
+\subsection{Summary of Items J--N}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{2cm}p{4cm}p{6cm}}
+\toprule
+Item & Requirement & Implementation \\
+\midrule
+J & Multiple clients
+& Selector-based event loop and separate client sessions. \\
+
+K & Error handling
+& Numeric error replies, malformed-input handling, and timeout cleanup. \\
+
+L & Private messaging
+& Nickname-based routing using \texttt{PRIVMSG}. \\
+
+M & Channel joining and leaving
+& \texttt{JOIN}, \texttt{PART}, channel membership, and names replies. \\
+
+N & Channel messaging
+& Channel broadcast using \texttt{PRIVMSG}. \\
+
+\bottomrule
+\end{tabular}
+\caption{Mapping between marking criteria and server implementation}
+\end{table}
+
+\section{Running and Testing}
+
+\subsection{Two Virtual Machines}
+
+On Ubuntu, start the server:
+
+\begin{lstlisting}[language=bash]
+python3 server.py
+\end{lstlisting}
+
+On Windows, start the bot:
+
+\begin{lstlisting}[language=PowerShell]
+python bot.py
+\end{lstlisting}
+
+Connect with HexChat and enter:
+
+\begin{lstlisting}
+/join #test
+\end{lstlisting}
+
+The following commands can then be entered in the channel:
+
+\begin{lstlisting}
+!hello
+!slap
+!slap Alice
+!me waves
+!who
+\end{lstlisting}
+
+Sending a private message to the bot tests the random fact reply.
+
+\subsection{Local Testing}
+
+For local testing on one computer, use the IPv6 loopback address:
+
+\begin{lstlisting}[language=PowerShell]
+python server.py --host ::1 --port 16667
+python bot.py --host ::1 --port 16667 --name TestBot --channel "#local"
+\end{lstlisting}
+
+In HexChat, use server address \texttt{::1}, port \texttt{16667}, and disable SSL. Join \texttt{\#local}, then run the commands in Table~\ref{tab:botcommands}.
+
+
+\section{Team Responsibilities}
+
+The following table is intentionally blank. Fill it in with the group's actual names, student numbers, and contributions.
+
+\begin{longtable}{p{5.3cm}p{3cm}p{5.3cm}}
+\caption{Team responsibilities}
+\label{tab:team}\\
+\toprule
+Name/Student ID & Module & Specific contribution \\
+\midrule
+\endfirsthead
+
+\toprule
+Name/Student ID & Module & Specific contribution \\
+\midrule
+\endhead
+
+Zhuoyuan He / 2666094 & & \\
+Zheng Gong / 2666141 & & \\
+Ruihang Gao / 2666078 & & \\
+Qiwei Zhao / 2666205 & & \\
+Daran Deng / 2666127 & & \\
+
+\bottomrule
+\end{longtable}
+
+Possible areas include server implementation, bot implementation, IPv6 and virtual-machine configuration, HexChat testing, documentation, and demonstration preparation. Each entry should reflect actual work.
+
+\section{Project File List}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{4cm}p{8cm}}
+\toprule
+File & Purpose \\
+\midrule
+\texttt{server.py} & IPv6 IRC server source code. \\
+\texttt{bot.py} & IRC bot client source code. \\
+\texttt{facts.txt} & Private-message replies, one fact per line. \\
+\texttt{README.md} & Basic project and run instructions. \\
+\texttt{marking-sheet.pdf} & The completed course marking sheet. \\
+\bottomrule
+\end{tabular}
+\caption{Recommended submission files}
+\end{table}
+
+\section{Current Status and Future Work}
+
+The current version implements IPv6 connections, IRC registration, channel joining and leaving, channel messages, private messages, bot commands, random fact replies, the WHO extension, PING/PONG keep-alive, and automatic reconnection.
+
+Before submission, the team should add the actual member information, record test results or screenshots, and check each item against the marking sheet.
+
+\end{document}
