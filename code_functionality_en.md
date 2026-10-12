@@ -92,7 +92,7 @@ The marking scheme repeatedly mentions **HexChat** (a GUI IRC client). In HexCha
 - **Requirement**: The bot reacts to `!`-prefixed commands in the channel.
 - **Implementation**: `_handle_command()` handles:
   - `!hello` → "Hello <sender>! Nice to meet you."
-  - `!slap [target]` → slaps a random member (excluding bot and sender); with a named target it slaps that user, or the sender if the user is absent (matches the criteria).
+  - `!slap [target]` → slaps a random member (excluding bot and sender); with a named target it slaps that user, or another member if the user is absent (marking criteria H4 requires the slapped user to be neither the bot nor the sender).
 - **What you type** in `#test`:
   ```
   !hello
