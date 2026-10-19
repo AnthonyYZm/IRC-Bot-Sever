@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""A small IPv6 IRC server for the DI31001 socket-programming assignment.
-
-The implementation intentionally focuses on the subset needed by the coursework:
-registration, multiple clients, JOIN/PART/QUIT, private/channel PRIVMSG,
-NAMES, basic errors, connection liveness, and HexChat compatibility helpers.
-
-Run on the Ubuntu VM:
-    python3 server.py
-
-Defaults:
-    bind address: ::
-    port:         6667
-"""
+"""Small IPv6 IRC server for the DI31001 socket-programming assignment."""
 
 from __future__ import annotations
 
@@ -23,30 +11,28 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 CRLF = b"\r\n"
-MAX_IRC_LINE_BYTES = 512  # RFC limit, including CRLF
+MAX_IRC_LINE_BYTES = 512
 MAX_RECV_BUFFER = 8192
 MAX_SEND_BUFFER = 1024 * 1024
 PING_AFTER = 30.0
-DROP_AFTER_PING = 30.0  # ~60 seconds with no complete command
+DROP_AFTER_PING = 30.0
 SERVER_NAME = "irc.assignment.local"
 SERVER_VERSION = "course-irc-1.0"
+IRC_CASE_TRANSLATION = str.maketrans({"[": "{", "]": "}", "\\": "|", "^": "~"})
 
-# A practical RFC-style nickname subset. This is stricter than accepting arbitrary text,
-# which lets the server reject malformed names rather than polluting its nick index.
 NICK_RE = re.compile(r"^[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]{0,29}$")
 
 
 def irc_casefold(value: str) -> str:
-    """Case-fold using the traditional IRC ASCII mapping."""
-    table = str.maketrans({"[": "{", "]": "}", "\\": "|", "^": "~"})
-    return value.lower().translate(table)
+    """Apply IRC's case-insensitive nickname and channel mapping."""
+    return value.lower().translate(IRC_CASE_TRANSLATION)
 
 
 def valid_channel_name(name: str) -> bool:
+    """Return whether a channel name is safe for this coursework subset."""
     if not name.startswith("#") or len(name) < 2 or len(name) > 50:
         return False
     return not any(ch in name for ch in (" ", ",", "\x00", "\x07", "\r", "\n", ":"))
@@ -54,18 +40,21 @@ def valid_channel_name(name: str) -> bool:
 
 @dataclass(frozen=True)
 class IRCMessage:
-    prefix: Optional[str]
+    """Parsed IRC message independent of socket handling."""
+
+    prefix: str | None
     command: str
     params: tuple[str, ...] = ()
 
 
 def parse_irc_line(line: str) -> IRCMessage:
-    """Parse one IRC line. This function has no socket/network dependency."""
-    line = line.rstrip("\r\n")
+    """Parse one CRLF-free IRC line into its prefix, command, and parameters."""
+    if any(control in line for control in ("\x00", "\r", "\n")):
+        raise ValueError("IRC line contains a forbidden control character")
     if not line:
         raise ValueError("empty IRC line")
 
-    prefix: Optional[str] = None
+    prefix: str | None = None
     rest = line
     if rest.startswith(":"):
         try:
@@ -74,7 +63,7 @@ def parse_irc_line(line: str) -> IRCMessage:
             raise ValueError("prefix without command") from exc
         rest = rest.lstrip()
 
-    trailing: Optional[str] = None
+    trailing: str | None = None
     if " :" in rest:
         rest, trailing = rest.split(" :", 1)
 
@@ -90,8 +79,8 @@ def parse_irc_line(line: str) -> IRCMessage:
     return IRCMessage(prefix=prefix, command=command, params=tuple(params))
 
 
-def format_irc(prefix: Optional[str], command: str, *params: str) -> str:
-    """Generate one IRC line without CRLF. This function has no socket dependency."""
+def format_irc(prefix: str | None, command: str, *params: str) -> str:
+    """Format one IRC line without performing network I/O."""
     chunks: list[str] = []
     if prefix:
         chunks.append(f":{prefix}")
@@ -100,7 +89,9 @@ def format_irc(prefix: Optional[str], command: str, *params: str) -> str:
     for i, param in enumerate(params):
         is_last = i == len(params) - 1
         if is_last and (param == "" or " " in param or param.startswith(":")):
-            chunks.append(":" + param.lstrip(":"))
+            # One colon marks the trailing field.  A leading colon already in
+            # the parameter is message data and must not be stripped.
+            chunks.append(":" + param)
         else:
             chunks.append(param)
     return " ".join(chunks)
@@ -108,26 +99,30 @@ def format_irc(prefix: Optional[str], command: str, *params: str) -> str:
 
 @dataclass(eq=False)
 class ClientSession:
+    """Per-socket identity, membership, buffering, and liveness state."""
+
     sock: socket.socket
-    addr: tuple
+    addr: tuple[str, int, int, int]
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    nickname: Optional[str] = None
-    username: Optional[str] = None
-    realname: Optional[str] = None
+    nickname: str | None = None
+    username: str | None = None
+    realname: str | None = None
     registered: bool = False
     recv_buffer: bytearray = field(default_factory=bytearray)
     send_buffer: bytearray = field(default_factory=bytearray)
-    channels: set[str] = field(default_factory=set)  # normalized channel keys
+    channels: set[str] = field(default_factory=set)
     last_activity: float = field(default_factory=time.monotonic)
-    ping_token: Optional[str] = None
-    ping_sent_at: Optional[float] = None
+    ping_token: str | None = None
+    ping_sent_at: float | None = None
     closed: bool = False
 
     @property
     def host(self) -> str:
+        """Return the peer's numeric IPv6 address."""
         return str(self.addr[0]) if self.addr else "unknown"
 
     def prefix(self) -> str:
+        """Return the nick!user@host prefix used in relayed messages."""
         nick = self.nickname or "*"
         user = self.username or "unknown"
         return f"{nick}!{user}@{self.host}"
@@ -135,30 +130,33 @@ class ClientSession:
 
 @dataclass
 class Channel:
+    """Canonical channel name and its connected member sessions."""
+
     name: str
     members: set[ClientSession] = field(default_factory=set)
 
 
 class IRCServer:
+    """Serve multiple IPv6 IRC clients with one non-blocking selector loop."""
+
     def __init__(self, host: str = "::", port: int = 6667) -> None:
         self.host = host
         self.port = port
         self.selector = selectors.DefaultSelector()
-        self.listener: Optional[socket.socket] = None
+        self.listener: socket.socket | None = None
         self.sessions: dict[socket.socket, ClientSession] = {}
         self.nick_index: dict[str, ClientSession] = {}
         self.channels: dict[str, Channel] = {}
         self.running = False
 
-    # --------------------------- network layer ---------------------------
-
     def start(self) -> None:
+        """Bind the IPv6 listener and run until stopped or interrupted."""
         listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-        except OSError:
-            pass
+        except OSError as exc:
+            logging.debug("IPV6_V6ONLY is unavailable: %s", exc)
         listener.bind((self.host, self.port))
         listener.listen()
         listener.setblocking(False)
@@ -170,7 +168,6 @@ class IRCServer:
 
         try:
             while self.running:
-                # Blocking in select keeps idle CPU low instead of busy-spinning.
                 for key, mask in self.selector.select(timeout=1.0):
                     if key.data is None:
                         self._accept_client()
@@ -187,18 +184,19 @@ class IRCServer:
             self.shutdown()
 
     def shutdown(self) -> None:
+        """Close all sessions, the listener, and the selector."""
         self.running = False
         for session in list(self.sessions.values()):
             self._disconnect(session, "Server shutting down", announce=False)
         if self.listener is not None:
             try:
                 self.selector.unregister(self.listener)
-            except Exception:
-                pass
+            except KeyError:
+                logging.debug("listener was already unregistered")
             try:
                 self.listener.close()
-            except OSError:
-                pass
+            except OSError as exc:
+                logging.debug("listener close failed: %s", exc)
             self.listener = None
         self.selector.close()
 
@@ -252,7 +250,6 @@ class IRCServer:
                 line = raw.decode("utf-8", errors="replace")
                 message = parse_irc_line(line)
             except ValueError:
-                # Empty/malformed lines are isolated to this client and never crash the server.
                 self._numeric(session, "421", "*", "Malformed command")
                 continue
 
@@ -287,7 +284,8 @@ class IRCServer:
         events = selectors.EVENT_READ | (selectors.EVENT_WRITE if want_write else 0)
         try:
             self.selector.modify(session.sock, events, data=session)
-        except Exception:
+        except (KeyError, OSError, ValueError) as exc:
+            logging.warning("[%s] selector update failed: %s", session.id, exc)
             self._disconnect(session, "Selector failure")
 
     def _queue_line(self, session: ClientSession, line: str) -> None:
@@ -309,16 +307,33 @@ class IRCServer:
             return
         try:
             session.sock.send(session.send_buffer)
-        except OSError:
-            pass
-
-    # --------------------------- protocol helpers ---------------------------
+        except OSError as exc:
+            logging.debug("[%s] final send failed: %s", session.id, exc)
 
     def _target(self, session: ClientSession) -> str:
         return session.nickname or "*"
 
     def _numeric(self, session: ClientSession, code: str, *params: str) -> None:
         self._queue_line(session, format_irc(SERVER_NAME, code, self._target(session), *params))
+
+    @staticmethod
+    def _forwarded_message(
+        sender: ClientSession,
+        command: str,
+        target: str,
+        text: str,
+    ) -> str:
+        """Build a relayed message that remains within IRC's 512-byte limit."""
+        empty_line = format_irc(sender.prefix(), command, target, "")
+        text_budget = max(
+            0,
+            MAX_IRC_LINE_BYTES - len(CRLF) - len(empty_line.encode("utf-8")),
+        )
+
+        encoded = text.encode("utf-8")
+        if len(encoded) > text_budget:
+            text = encoded[:text_budget].decode("utf-8", errors="ignore")
+        return format_irc(sender.prefix(), command, target, text)
 
     def _require_registered(self, session: ClientSession) -> bool:
         if session.registered:
@@ -331,15 +346,22 @@ class IRCServer:
             return
 
         session.registered = True
-        nick = session.nickname
         self._numeric(session, "001", f"Welcome to the IRC server {session.prefix()}")
-        self._numeric(session, "002", f"Your host is {SERVER_NAME}, running version {SERVER_VERSION}")
-        self._numeric(session, "003", "This server was created for the socket programming assignment")
+        self._numeric(
+            session,
+            "002",
+            f"Your host is {SERVER_NAME}, running version {SERVER_VERSION}",
+        )
+        self._numeric(
+            session,
+            "003",
+            "This server was created for the socket programming assignment",
+        )
         self._numeric(session, "004", SERVER_NAME, SERVER_VERSION, "i", "nt")
         self._numeric(session, "375", f"- {SERVER_NAME} Message of the Day -")
         self._numeric(session, "372", "- Minimal coursework IRC server")
         self._numeric(session, "376", "End of MOTD command")
-        logging.info("[%s] registered as %s", session.id, nick)
+        logging.info("[%s] registered as %s", session.id, session.nickname)
 
     def _shared_peers(self, session: ClientSession) -> set[ClientSession]:
         peers: set[ClientSession] = set()
@@ -354,7 +376,7 @@ class IRCServer:
         self,
         channel: Channel,
         line: str,
-        exclude: Optional[ClientSession] = None,
+        exclude: ClientSession | None = None,
     ) -> None:
         for member in list(channel.members):
             if member is exclude or member.closed:
@@ -385,8 +407,6 @@ class IRCServer:
             self._numeric(session, "353", *base_params, " ".join(current))
         self._numeric(session, "366", channel.name, "End of NAMES list")
 
-    # --------------------------- command dispatch ---------------------------
-
     def _dispatch(self, session: ClientSession, msg: IRCMessage) -> None:
         handlers = {
             "CAP": self._cmd_cap,
@@ -410,16 +430,14 @@ class IRCServer:
         handler(session, msg.params)
 
     def _cmd_cap(self, session: ClientSession, params: tuple[str, ...]) -> None:
-        # HexChat often negotiates CAP before NICK/USER. We advertise no optional capabilities.
         if not params:
             return
-        sub = params[-1].upper() if len(params) == 1 else params[0].upper()
+        sub = params[0].upper()
         if sub == "LS":
             self._queue_line(session, format_irc(SERVER_NAME, "CAP", "*", "LS", ""))
         elif sub == "REQ":
-            requested = params[-1] if params else ""
+            requested = params[-1]
             self._queue_line(session, format_irc(SERVER_NAME, "CAP", "*", "NAK", requested))
-        # CAP END needs no reply.
 
     def _cmd_nick(self, session: ClientSession, params: tuple[str, ...]) -> None:
         if not params or not params[0]:
@@ -472,7 +490,7 @@ class IRCServer:
         token = params[-1]
         self._queue_line(session, format_irc(SERVER_NAME, "PONG", SERVER_NAME, token))
 
-    def _cmd_pong(self, session: ClientSession, params: tuple[str, ...]) -> None:
+    def _cmd_pong(self, session: ClientSession, _params: tuple[str, ...]) -> None:
         session.ping_token = None
         session.ping_sent_at = None
 
@@ -544,11 +562,11 @@ class IRCServer:
             return
 
         for requested in params[0].split(","):
-            channel = self.channels.get(irc_casefold(requested))
-            if channel is None:
+            requested_channel = self.channels.get(irc_casefold(requested))
+            if requested_channel is None:
                 self._numeric(session, "366", requested, "End of NAMES list")
             else:
-                self._send_names(session, channel)
+                self._send_names(session, requested_channel)
 
     def _cmd_privmsg(self, session: ClientSession, params: tuple[str, ...]) -> None:
         if not self._require_registered(session):
@@ -565,7 +583,6 @@ class IRCServer:
             self._route_message(session, target, text, command="PRIVMSG", errors=True)
 
     def _cmd_notice(self, session: ClientSession, params: tuple[str, ...]) -> None:
-        # NOTICE uses PRIVMSG-like routing but, by IRC convention, does not generate errors.
         if not session.registered or len(params) < 2:
             return
         text = params[1]
@@ -580,8 +597,6 @@ class IRCServer:
         command: str,
         errors: bool,
     ) -> None:
-        line = format_irc(sender.prefix(), command, target, text)
-
         if target.startswith("#"):
             channel = self.channels.get(irc_casefold(target))
             if channel is None:
@@ -592,7 +607,7 @@ class IRCServer:
                 if errors:
                     self._numeric(sender, "404", channel.name, "Cannot send to channel")
                 return
-            # HexChat already locally displays its own sent text, so do not echo it back.
+            line = self._forwarded_message(sender, command, channel.name, text)
             self._broadcast_channel(channel, line, exclude=sender)
             return
 
@@ -601,10 +616,10 @@ class IRCServer:
             if errors:
                 self._numeric(sender, "401", target, "No such nick/channel")
             return
+        line = self._forwarded_message(sender, command, recipient.nickname or target, text)
         self._queue_line(recipient, line)
 
     def _cmd_mode(self, session: ClientSession, params: tuple[str, ...]) -> None:
-        # Small compatibility helper for real IRC clients such as HexChat.
         if not self._require_registered(session) or not params:
             return
         target = params[0]
@@ -620,7 +635,6 @@ class IRCServer:
                 self._numeric(session, "221", "+")
 
     def _cmd_who(self, session: ClientSession, params: tuple[str, ...]) -> None:
-        # HexChat may issue WHO after JOIN to enrich its user list.
         if not self._require_registered(session):
             return
         mask = params[0] if params else "*"
@@ -640,8 +654,6 @@ class IRCServer:
             )
         self._numeric(session, "315", mask, "End of WHO list")
 
-    # --------------------------- cleanup / liveness ---------------------------
-
     def _check_liveness(self) -> None:
         now = time.monotonic()
         for session in list(self.sessions.values()):
@@ -649,7 +661,10 @@ class IRCServer:
                 continue
 
             if session.ping_token is not None:
-                if session.ping_sent_at is not None and now - session.ping_sent_at >= DROP_AFTER_PING:
+                if (
+                    session.ping_sent_at is not None
+                    and now - session.ping_sent_at >= DROP_AFTER_PING
+                ):
                     logging.info("[%s] timed out waiting for PONG", session.id)
                     self._disconnect(session, "Ping timeout")
                 continue
@@ -684,17 +699,18 @@ class IRCServer:
         self.sessions.pop(session.sock, None)
         try:
             self.selector.unregister(session.sock)
-        except Exception:
-            pass
+        except (KeyError, ValueError):
+            logging.debug("[%s] socket was already unregistered", session.id)
         try:
             session.sock.close()
-        except OSError:
-            pass
+        except OSError as exc:
+            logging.debug("[%s] socket close failed: %s", session.id, exc)
 
         logging.info("[%s] disconnected: %s", session.id, reason)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Create the server command-line parser."""
     parser = argparse.ArgumentParser(description="Minimal IPv6 IRC server for the coursework")
     parser.add_argument("--host", default="::", help="IPv6 bind address (default: ::)")
     parser.add_argument("--port", type=int, default=6667, help="TCP port (default: 6667)")
@@ -703,6 +719,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Configure logging and run the server."""
     args = build_arg_parser().parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
