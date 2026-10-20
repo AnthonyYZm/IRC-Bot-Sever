@@ -317,14 +317,10 @@ class IRCServer:
         self._queue_line(session, format_irc(SERVER_NAME, code, self._target(session), *params))
 
     @staticmethod
-    def _forwarded_message(
-        sender: ClientSession,
-        command: str,
-        target: str,
-        text: str,
-    ) -> str:
-        """Build a relayed message that remains within IRC's 512-byte limit."""
-        empty_line = format_irc(sender.prefix(), command, target, "")
+    def _bounded_line(prefix: str, command: str, *params: str) -> str:
+        """Trim a trailing text field so a prefixed IRC line can be delivered."""
+        fixed_params, text = params[:-1], params[-1]
+        empty_line = format_irc(prefix, command, *fixed_params, "")
         text_budget = max(
             0,
             MAX_IRC_LINE_BYTES - len(CRLF) - len(empty_line.encode("utf-8")),
@@ -333,7 +329,18 @@ class IRCServer:
         encoded = text.encode("utf-8")
         if len(encoded) > text_budget:
             text = encoded[:text_budget].decode("utf-8", errors="ignore")
-        return format_irc(sender.prefix(), command, target, text)
+        return format_irc(prefix, command, *fixed_params, text)
+
+    @classmethod
+    def _forwarded_message(
+        cls,
+        sender: ClientSession,
+        command: str,
+        target: str,
+        text: str,
+    ) -> str:
+        """Build a relayed PRIVMSG or NOTICE within the IRC line limit."""
+        return cls._bounded_line(sender.prefix(), command, target, text)
 
     def _require_registered(self, session: ClientSession) -> bool:
         if session.registered:
@@ -545,7 +552,7 @@ class IRCServer:
                 self._numeric(session, "442", channel.name, "You're not on that channel")
                 continue
 
-            line = format_irc(session.prefix(), "PART", channel.name, reason)
+            line = self._bounded_line(session.prefix(), "PART", channel.name, reason)
             self._broadcast_channel(channel, line)
             channel.members.discard(session)
             session.channels.discard(key)
@@ -680,7 +687,7 @@ class IRCServer:
             return
 
         if announce and session.registered and session.nickname:
-            quit_line = format_irc(session.prefix(), "QUIT", reason)
+            quit_line = self._bounded_line(session.prefix(), "QUIT", reason)
             for peer in self._shared_peers(session):
                 self._queue_line(peer, quit_line)
 

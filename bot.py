@@ -9,6 +9,7 @@ commands, which are not needed by the core bot behaviour.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import os
 import random
 import socket
@@ -103,8 +104,11 @@ class IRCBot:
         self.sock: socket.socket | None = None
         self._recv_buf = b""
         self.users: dict[str, str] = {}  # casefold(nick) -> display nick; members excluding self
-        self._names_pending = False    # True while a 353/366 name batch is open
-        self._who_replies: list[list[str]] = []  # accumulated WHO 352 records
+        self._names_pending = False
+        self._names_suppressed = False
+        self._names_snapshot: dict[str, str] = {}
+        self._names_changes: list[tuple[str, str, str]] = []
+        self._who_counts: deque[int] = deque()
         self.connected = False
         self.running = True
 
@@ -125,6 +129,11 @@ class IRCBot:
         self.connected = True
         self._recv_buf = b""
         self.users.clear()
+        self._names_pending = False
+        self._names_suppressed = False
+        self._names_snapshot.clear()
+        self._names_changes.clear()
+        self._who_counts.clear()
         self._register()
 
     def _register(self) -> None:
@@ -231,14 +240,30 @@ class IRCBot:
         elif command == "353":
             self._handle_names_reply(params)
         elif command == "366":
-            self._finish_names_reply()
+            self._finish_names_reply(params)
         elif command == "352":
-            self._who_replies.append(params)
+            self._record_who_reply(params)
         elif command == "315":
-            self._report_who()
+            self._report_who(params)
+
+    def _begin_names_reply(self) -> None:
+        self._names_pending = True
+        self._names_suppressed = False
+        self._names_snapshot.clear()
+        self._names_changes.clear()
+
+    def _forget_channel(self) -> None:
+        """Discard an in-flight NAMES batch after the bot leaves its channel."""
+        self.users.clear()
+        self._names_pending = False
+        self._names_suppressed = True
+        self._names_snapshot.clear()
+        self._names_changes.clear()
 
     def _handle_names_reply(self, params: list[str]) -> None:
         """Accumulate one RPL_NAMREPLY line for the configured channel."""
+        if self._names_suppressed:
+            return
         if (
             len(params) < 4
             or params[1] != "="
@@ -246,25 +271,55 @@ class IRCBot:
         ):
             return
         if not self._names_pending:
-            self.users.clear()
-            self._names_pending = True
+            self._begin_names_reply()
         self._update_users_from_names(params[3])
 
-    def _finish_names_reply(self) -> None:
+    def _finish_names_reply(self, params: list[str]) -> None:
+        if len(params) < 2 or irc_casefold(params[1]) != irc_casefold(self.channel):
+            return
+        if self._names_suppressed:
+            self._names_suppressed = False
+            return
+        names = self._names_snapshot.copy() if self._names_pending else {}
+        for change, old, new in self._names_changes:
+            old_key = irc_casefold(old)
+            if change == "add":
+                names[irc_casefold(new)] = new
+            elif change == "remove":
+                names.pop(old_key, None)
+            elif change == "rename" and old_key in names:
+                names.pop(old_key)
+                names[irc_casefold(new)] = new
+        names.pop(irc_casefold(self.nick), None)
+        self.users = names
         self._names_pending = False
+        self._names_snapshot.clear()
+        self._names_changes.clear()
         print(f"[names] member list complete ({len(self.users)} users)")
+
+    def _record_names_change(self, change: str, old: str, new: str = "") -> None:
+        if self._names_pending:
+            self._names_changes.append((change, old, new))
 
     def _handle_join(self, prefix: str | None, params: list[str]) -> None:
         who = nick_from_prefix(prefix)
         channel = params[0] if params else ""
         if who and irc_casefold(channel) == irc_casefold(self.channel):
-            self._add_user(who)
+            if irc_casefold(who) == irc_casefold(self.nick):
+                self._begin_names_reply()
+            else:
+                self._add_user(who)
+                self._record_names_change("add", "", who)
 
     def _handle_part(self, prefix: str | None, params: list[str]) -> None:
         who = nick_from_prefix(prefix)
         channel = params[0] if params else ""
         if who and irc_casefold(channel) == irc_casefold(self.channel):
-            self._remove_user(who)
+            if irc_casefold(who) == irc_casefold(self.nick):
+                self._forget_channel()
+            else:
+                self._remove_user(who)
+                self._record_names_change("remove", who)
 
     def _handle_kick(self, params: list[str]) -> None:
         channel = params[0] if params else ""
@@ -272,18 +327,22 @@ class IRCBot:
         if irc_casefold(channel) != irc_casefold(self.channel):
             return
         if irc_casefold(kicked_nick) == irc_casefold(self.nick):
-            self.users.clear()
+            self._forget_channel()
         else:
             self._remove_user(kicked_nick)
+            self._record_names_change("remove", kicked_nick)
 
     def _handle_quit(self, prefix: str | None) -> None:
         who = nick_from_prefix(prefix)
         if who:
             self._remove_user(who)
+            self._record_names_change("remove", who)
 
     def _handle_nick(self, prefix: str | None, params: list[str]) -> None:
         old = nick_from_prefix(prefix)
         new = params[0] if params else ""
+        if old and new:
+            self._record_names_change("rename", old, new)
         if irc_casefold(old) == irc_casefold(self.nick):
             self.nick = new
         elif self._irc_lower(old) in self.users:
@@ -312,7 +371,8 @@ class IRCBot:
     def _update_users_from_names(self, names_str: str) -> None:
         for n in names_str.split():
             n = n.strip().lstrip("@+~&%")  # strip channel-status prefixes
-            self._add_user(n)
+            if n:
+                self._names_snapshot[irc_casefold(n)] = n
 
     # --------------------------- PRIVMSG logic ---------------------------- #
     def _handle_privmsg(self, prefix: str | None, params: list[str]) -> None:
@@ -359,7 +419,7 @@ class IRCBot:
             # Extra feature (Item I): use the WHO command, which is not used
             # anywhere else in the bot. The server replies with 352/315.
             self._send(make_privmsg(self.channel, "Counting members via WHO..."))
-            self._who_replies = []
+            self._who_counts.append(0)
             self._send(format_irc("WHO", self.channel))
 
         elif cmd == "!notice":
@@ -404,13 +464,21 @@ class IRCBot:
             f"{CTCP}ACTION slaps {victim} around a bit with a large trout{CTCP}",
         ))
 
-    def _report_who(self) -> None:
-        n = len(self._who_replies)
+    def _record_who_reply(self, params: list[str]) -> None:
+        if self._who_counts and len(params) >= 2:
+            if irc_casefold(params[1]) == irc_casefold(self.channel):
+                self._who_counts[0] += 1
+
+    def _report_who(self, params: list[str]) -> None:
+        if not self._who_counts or len(params) < 2:
+            return
+        if irc_casefold(params[1]) != irc_casefold(self.channel):
+            return
+        count = self._who_counts.popleft()
         self._send(make_privmsg(
             self.channel,
-            f"WHO returned {n} member record(s) for {self.channel}.",
+            f"WHO returned {count} member record(s) for {self.channel}.",
         ))
-        self._who_replies = []
 
 
 # --------------------------------------------------------------------------- #
