@@ -108,7 +108,8 @@ class IRCBot:
         self._names_suppressed = False
         self._names_snapshot: dict[str, str] = {}
         self._names_changes: list[tuple[str, str, str]] = []
-        self._who_counts: deque[int] = deque()
+        self._who_pending: bool = False   # a WHO reply (352/315) is currently in flight
+        self._who_count: int = 0          # members counted for the in-flight WHO
         self.connected = False
         self.running = True
 
@@ -133,7 +134,8 @@ class IRCBot:
         self._names_suppressed = False
         self._names_snapshot.clear()
         self._names_changes.clear()
-        self._who_counts.clear()
+        self._who_pending = False
+        self._who_count = 0
         self._register()
 
     def _register(self) -> None:
@@ -418,8 +420,18 @@ class IRCBot:
         elif cmd == "!who":
             # Extra feature (Item I): use the WHO command, which is not used
             # anywhere else in the bot. The server replies with 352/315.
+            # IRC's WHO has no reply tag, so two overlapping WHO requests would
+            # interleave their 352 replies and corrupt the count. Serialise:
+            # ignore a new request while one is still in flight.
+            if self._who_pending:
+                self._send(make_privmsg(
+                    self.channel,
+                    f"{sender}, still counting the last WHO, one moment please.",
+                ))
+                return
+            self._who_pending = True
+            self._who_count = 0
             self._send(make_privmsg(self.channel, "Counting members via WHO..."))
-            self._who_counts.append(0)
             self._send(format_irc("WHO", self.channel))
 
         elif cmd == "!notice":
@@ -433,8 +445,11 @@ class IRCBot:
             self._send(format_irc("NOTICE", target, message))
 
     def _do_slap(self, sender: str, target: str) -> None:
-        # The H4 rubric requires the victim to be neither the bot nor sender.
-        # Nickname comparisons therefore use the RFC 2812 casemapping.
+        # Project Brief behaviour:
+        #   !slap           -> random member, excluding the bot and the sender
+        #   !slap <target>  -> that specific user; if they are not in the
+        #                      channel, slap the user sending the command
+        # Nickname comparisons use the RFC 2812 casemapping.
         bot_key = self._irc_lower(self.nick)
         sender_key = self._irc_lower(sender)
         victim: str | None
@@ -444,18 +459,21 @@ class IRCBot:
             if tgt_key == bot_key:
                 self._send(make_privmsg(self.channel, f"Hands off the bot, {sender}!"))
                 return
-            if tgt_key == sender_key:
-                self._send(make_privmsg(self.channel, f"I'm not slapping you, {sender}."))
-                return
             if tgt_key in self.users:
                 victim = self.users[tgt_key]
             else:
-                self._send(make_privmsg(self.channel, f"{target} is not in {self.channel}."))
-                return
+                # Brief: if the named user is not in the channel, slap the sender.
+                victim = sender
         else:
             victim = self._random_other(sender)
             if victim is None:
-                self._send(make_privmsg(self.channel, f"Nobody else to slap here, {sender}!"))
+                # No other member to pick at random. H4 requires the random
+                # pool to exclude the sender, so we never slap them here; we
+                # just say so. (Slapping the sender is only the deterministic
+                # fallback for a *named* target that is absent from the channel.)
+                self._send(make_privmsg(
+                    self.channel, f"Nobody else to slap here, {sender}!",
+                ))
                 return
 
         assert victim is not None
@@ -465,16 +483,18 @@ class IRCBot:
         ))
 
     def _record_who_reply(self, params: list[str]) -> None:
-        if self._who_counts and len(params) >= 2:
+        if self._who_pending and len(params) >= 2:
             if irc_casefold(params[1]) == irc_casefold(self.channel):
-                self._who_counts[0] += 1
+                self._who_count += 1
 
     def _report_who(self, params: list[str]) -> None:
-        if not self._who_counts or len(params) < 2:
+        if not self._who_pending or len(params) < 2:
             return
         if irc_casefold(params[1]) != irc_casefold(self.channel):
             return
-        count = self._who_counts.popleft()
+        count = self._who_count
+        self._who_pending = False
+        self._who_count = 0
         self._send(make_privmsg(
             self.channel,
             f"WHO returned {count} member record(s) for {self.channel}.",

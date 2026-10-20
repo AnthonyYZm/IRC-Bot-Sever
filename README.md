@@ -30,7 +30,7 @@ RFC（Request for Comments）就是**技术标准的说明书**。互联网上�
 
 ```powershell
 # from the folder that contains bot.py + facts.txt
-# 默认连本机 IPv6 回环 ::1；连另一台 VM 上的 server 时用环境变量或参数指定地址：
+# 默认连 Ubuntu VM 的 fc00:1337::17；本机测试时用 IRC_HOST=::1 或 --host ::1 覆盖：
 IRC_HOST=fc00:1337::17 python bot.py
 # 或者显式传参数：
 python bot.py --host fc00:1337::17 --port 6667 --name SuperBot --channel #test
@@ -47,10 +47,10 @@ Make sure the Ubuntu VM is already running `python3 server.py` first.
 | Join a channel                                   | `JOIN` after `001`                     |
 | Track members (for random slap)                  | `353`/`JOIN`/`PART`/`NICK`/`QUIT` parsers |
 | `!hello` greets the sender                       | `_handle_command`                      |
-| `!slap [target]` (never slaps bot or sender; named target absent -> slaps another member or reports) | `_do_slap` |
+| `!slap [target]` (random member excluding bot & sender; named target absent -> slaps the sender, per the Brief) | `_do_slap` |
 | Reply to every private message with a random fact | `_reply_private` (reads `facts.txt`)  |
 | One extra feature using a new IRC command        | `!me` = **CTCP ACTION**; `!who` = **WHO** command |
-| Must accept `--host/--port/--name/--channel`     | `parse_args`（host 默认 `::1`，可用 `IRC_HOST` 环境变量或 `--host` 覆盖；其余默认对齐实验文档） |
+| Must accept `--host/--port/--name/--channel`     | `parse_args`（host 默认 `fc00:1337::17`，可用 `IRC_HOST` 环境变量或 `--host` 覆盖；其余默认对齐实验文档） |
 
 ## Files
 
